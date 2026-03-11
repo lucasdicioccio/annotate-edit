@@ -59,6 +59,14 @@ enum AnnotationKind {
         max: (f32, f32),
         color: Color4,
         thickness: f32,
+        fill_color: Option<Color4>,
+    },
+    Oval {
+        min: (f32, f32),
+        max: (f32, f32),
+        color: Color4,
+        thickness: f32,
+        fill_color: Option<Color4>,
     },
     Text {
         pos: (f32, f32),
@@ -117,6 +125,7 @@ fn save_annotations(image_path: &Path, annotations: &[Annotation]) {
 enum Tool {
     Arrow,
     Rectangle,
+    Oval,
     Text,
     Select,
 }
@@ -144,6 +153,8 @@ struct AnnotateApp {
     color: [f32; 3],
     thickness: f32,
     font_size: f32,
+    fill_enabled: bool,
+    fill_color: [f32; 3],
 
     drag: DragState,
     selected: Option<usize>,
@@ -179,6 +190,8 @@ impl AnnotateApp {
             color: [1.0, 0.0, 0.0],
             thickness: 3.0,
             font_size: 20.0,
+            fill_enabled: false,
+            fill_color: [1.0, 1.0, 0.0],
             drag: DragState::None,
             selected: None,
             text_input_pos: None,
@@ -195,6 +208,19 @@ impl AnnotateApp {
             g: self.color[1],
             b: self.color[2],
             a: 1.0,
+        }
+    }
+
+    fn current_fill_color4(&self) -> Option<Color4> {
+        if self.fill_enabled {
+            Some(Color4 {
+                r: self.fill_color[0],
+                g: self.fill_color[1],
+                b: self.fill_color[2],
+                a: 1.0,
+            })
+        } else {
+            None
         }
     }
 
@@ -308,6 +334,7 @@ impl AnnotateApp {
                     max,
                     color,
                     thickness,
+                    fill_color,
                 } => {
                     let s_min =
                         self.image_to_screen(canvas_rect, egui::pos2(min.0, min.1));
@@ -316,9 +343,32 @@ impl AnnotateApp {
                     let rect = egui::Rect::from_two_pos(s_min, s_max);
                     let c = color.to_egui();
                     let t = thickness * self.zoom;
-                    painter.rect_stroke(rect, 0.0, egui::Stroke::new(t, c), egui::StrokeKind::Middle);
+                    let fill = fill_color.as_ref().map(|fc| fc.to_egui()).unwrap_or(egui::Color32::TRANSPARENT);
+                    painter.rect(rect, 0.0, fill, egui::Stroke::new(t, c), egui::StrokeKind::Middle);
                     if is_selected {
                         self.draw_selection_indicator(painter, rect);
+                    }
+                }
+                AnnotationKind::Oval {
+                    min,
+                    max,
+                    color,
+                    thickness,
+                    fill_color,
+                } => {
+                    let s_min =
+                        self.image_to_screen(canvas_rect, egui::pos2(min.0, min.1));
+                    let s_max =
+                        self.image_to_screen(canvas_rect, egui::pos2(max.0, max.1));
+                    let center = egui::pos2((s_min.x + s_max.x) * 0.5, (s_min.y + s_max.y) * 0.5);
+                    let radii = egui::vec2((s_max.x - s_min.x).abs() * 0.5, (s_max.y - s_min.y).abs() * 0.5);
+                    let c = color.to_egui();
+                    let t = thickness * self.zoom;
+                    let fill = fill_color.as_ref().map(|fc| fc.to_egui()).unwrap_or(egui::Color32::TRANSPARENT);
+                    painter.add(egui::epaint::EllipseShape { center, radius: radii, fill, stroke: egui::Stroke::new(t, c) });
+                    let bounding = egui::Rect::from_two_pos(s_min, s_max);
+                    if is_selected {
+                        self.draw_selection_indicator(painter, bounding);
                     }
                 }
                 AnnotationKind::Text {
@@ -379,6 +429,7 @@ impl AnnotateApp {
                     min,
                     max,
                     thickness,
+                    fill_color,
                     ..
                 } => {
                     let s_min =
@@ -386,9 +437,45 @@ impl AnnotateApp {
                     let s_max =
                         self.image_to_screen(canvas_rect, egui::pos2(max.0, max.1));
                     let rect = egui::Rect::from_two_pos(s_min, s_max);
-                    let expanded = rect.expand(thickness * self.zoom + 8.0);
-                    let shrunk = rect.shrink(thickness * self.zoom + 8.0);
-                    expanded.contains(screen_pos) && !shrunk.contains(screen_pos)
+                    if fill_color.is_some() {
+                        rect.expand(thickness * self.zoom + 4.0).contains(screen_pos)
+                    } else {
+                        let expanded = rect.expand(thickness * self.zoom + 8.0);
+                        let shrunk = rect.shrink(thickness * self.zoom + 8.0);
+                        expanded.contains(screen_pos) && !shrunk.contains(screen_pos)
+                    }
+                }
+                AnnotationKind::Oval {
+                    min,
+                    max,
+                    thickness,
+                    fill_color,
+                    ..
+                } => {
+                    let s_min =
+                        self.image_to_screen(canvas_rect, egui::pos2(min.0, min.1));
+                    let s_max =
+                        self.image_to_screen(canvas_rect, egui::pos2(max.0, max.1));
+                    let cx = (s_min.x + s_max.x) * 0.5;
+                    let cy = (s_min.y + s_max.y) * 0.5;
+                    let slack = thickness * self.zoom + 8.0;
+                    let rx = (s_max.x - s_min.x).abs() * 0.5;
+                    let ry = (s_max.y - s_min.y).abs() * 0.5;
+                    let dx = screen_pos.x - cx;
+                    let dy = screen_pos.y - cy;
+                    if fill_color.is_some() {
+                        let rx = (rx + slack).max(1.0);
+                        let ry = (ry + slack).max(1.0);
+                        (dx / rx).powi(2) + (dy / ry).powi(2) <= 1.0
+                    } else {
+                        let outer_rx = (rx + slack).max(1.0);
+                        let outer_ry = (ry + slack).max(1.0);
+                        let inner_rx = (rx - slack).max(0.001);
+                        let inner_ry = (ry - slack).max(0.001);
+                        let outside_inner = (dx / inner_rx).powi(2) + (dy / inner_ry).powi(2) >= 1.0;
+                        let inside_outer = (dx / outer_rx).powi(2) + (dy / outer_ry).powi(2) <= 1.0;
+                        outside_inner && inside_outer
+                    }
                 }
                 AnnotationKind::Text {
                     pos,
@@ -423,7 +510,8 @@ impl AnnotateApp {
                     end.0 += delta_img.x;
                     end.1 += delta_img.y;
                 }
-                AnnotationKind::Rectangle { min, max, .. } => {
+                AnnotationKind::Rectangle { min, max, .. }
+                | AnnotationKind::Oval { min, max, .. } => {
                     min.0 += delta_img.x;
                     min.1 += delta_img.y;
                     max.0 += delta_img.x;
@@ -491,6 +579,7 @@ impl AnnotateApp {
                     max,
                     color,
                     thickness,
+                    fill_color,
                 } => {
                     let c = [
                         (color.r * 255.0) as u8,
@@ -498,6 +587,15 @@ impl AnnotateApp {
                         (color.b * 255.0) as u8,
                         (color.a * 255.0) as u8,
                     ];
+                    if let Some(fc) = fill_color {
+                        let fc = [
+                            (fc.r * 255.0) as u8,
+                            (fc.g * 255.0) as u8,
+                            (fc.b * 255.0) as u8,
+                            (fc.a * 255.0) as u8,
+                        ];
+                        fill_rect_on_image(&mut img, min.0, min.1, max.0, max.1, fc);
+                    }
                     draw_line_on_image(
                         &mut img, min.0, min.1, max.0, min.1, *thickness, c,
                     );
@@ -510,6 +608,34 @@ impl AnnotateApp {
                     draw_line_on_image(
                         &mut img, min.0, max.1, min.0, min.1, *thickness, c,
                     );
+                }
+                AnnotationKind::Oval {
+                    min,
+                    max,
+                    color,
+                    thickness,
+                    fill_color,
+                } => {
+                    let c = [
+                        (color.r * 255.0) as u8,
+                        (color.g * 255.0) as u8,
+                        (color.b * 255.0) as u8,
+                        (color.a * 255.0) as u8,
+                    ];
+                    let cx = (min.0 + max.0) * 0.5;
+                    let cy = (min.1 + max.1) * 0.5;
+                    let rx = (max.0 - min.0).abs() * 0.5;
+                    let ry = (max.1 - min.1).abs() * 0.5;
+                    if let Some(fc) = fill_color {
+                        let fc = [
+                            (fc.r * 255.0) as u8,
+                            (fc.g * 255.0) as u8,
+                            (fc.b * 255.0) as u8,
+                            (fc.a * 255.0) as u8,
+                        ];
+                        fill_oval_on_image(&mut img, cx, cy, rx, ry, fc);
+                    }
+                    draw_oval_on_image(&mut img, cx, cy, rx, ry, *thickness, c);
                 }
                 AnnotationKind::Text { .. } => {
                     // Text rendering to image requires a font rasterizer;
@@ -572,6 +698,78 @@ fn draw_line_on_image(
     }
 }
 
+fn draw_oval_on_image(
+    img: &mut RgbaImage,
+    cx: f32,
+    cy: f32,
+    rx: f32,
+    ry: f32,
+    thickness: f32,
+    color: [u8; 4],
+) {
+    let steps = ((rx.max(ry) * std::f32::consts::TAU) as usize).max(64);
+    let half_t = (thickness / 2.0).max(0.5) as i32;
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    for i in 0..steps {
+        let angle = i as f32 / steps as f32 * std::f32::consts::TAU;
+        let px = (cx + rx * angle.cos()) as i32;
+        let py = (cy + ry * angle.sin()) as i32;
+        for oy in -half_t..=half_t {
+            for ox in -half_t..=half_t {
+                let x = px + ox;
+                let y = py + oy;
+                if x >= 0 && x < w && y >= 0 && y < h {
+                    img.put_pixel(x as u32, y as u32, image::Rgba(color));
+                }
+            }
+        }
+    }
+}
+
+fn fill_oval_on_image(
+    img: &mut RgbaImage,
+    cx: f32,
+    cy: f32,
+    rx: f32,
+    ry: f32,
+    color: [u8; 4],
+) {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let x0 = ((cx - rx) as i32).max(0);
+    let x1 = ((cx + rx) as i32 + 1).min(w);
+    let y0 = ((cy - ry) as i32).max(0);
+    let y1 = ((cy + ry) as i32 + 1).min(h);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let dx = (x as f32 - cx) / rx;
+            let dy = (y as f32 - cy) / ry;
+            if dx * dx + dy * dy <= 1.0 {
+                img.put_pixel(x as u32, y as u32, image::Rgba(color));
+            }
+        }
+    }
+}
+
+fn fill_rect_on_image(
+    img: &mut RgbaImage,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    color: [u8; 4],
+) {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let lx = (x0.min(x1) as i32).max(0);
+    let rx = (x0.max(x1) as i32 + 1).min(w);
+    let ty = (y0.min(y1) as i32).max(0);
+    let by = (y0.max(y1) as i32 + 1).min(h);
+    for y in ty..by {
+        for x in lx..rx {
+            img.put_pixel(x as u32, y as u32, image::Rgba(color));
+        }
+    }
+}
+
 // ── eframe App impl ────────────────────────────────────────────────────────
 
 impl eframe::App for AnnotateApp {
@@ -610,6 +808,7 @@ impl eframe::App for AnnotateApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tool, Tool::Arrow, "Arrow");
                 ui.selectable_value(&mut self.tool, Tool::Rectangle, "Rectangle");
+                ui.selectable_value(&mut self.tool, Tool::Oval, "Oval");
                 ui.selectable_value(&mut self.tool, Tool::Text, "Text");
                 ui.selectable_value(&mut self.tool, Tool::Select, "Select");
                 ui.separator();
@@ -618,6 +817,13 @@ impl eframe::App for AnnotateApp {
                 ui.separator();
                 ui.label("Thickness:");
                 ui.add(egui::Slider::new(&mut self.thickness, 1.0..=20.0));
+                if matches!(self.tool, Tool::Rectangle | Tool::Oval) {
+                    ui.separator();
+                    ui.checkbox(&mut self.fill_enabled, "Fill:");
+                    if self.fill_enabled {
+                        ui.color_edit_button_rgb(&mut self.fill_color);
+                    }
+                }
                 if self.tool == Tool::Text {
                     ui.separator();
                     ui.label("Font:");
@@ -689,12 +895,33 @@ impl eframe::App for AnnotateApp {
                         }
                         Tool::Rectangle => {
                             let rect = egui::Rect::from_two_pos(start, current);
-                            painter.rect_stroke(
-                                rect,
-                                0.0,
-                                egui::Stroke::new(t, c),
-                                egui::StrokeKind::Middle,
-                            );
+                            let fill = if self.fill_enabled {
+                                egui::Color32::from_rgba_unmultiplied(
+                                    (self.fill_color[0] * 255.0) as u8,
+                                    (self.fill_color[1] * 255.0) as u8,
+                                    (self.fill_color[2] * 255.0) as u8,
+                                    255,
+                                )
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            painter.rect(rect, 0.0, fill, egui::Stroke::new(t, c), egui::StrokeKind::Middle);
+                        }
+                        Tool::Oval => {
+                            let rect = egui::Rect::from_two_pos(start, current);
+                            let center = rect.center();
+                            let radii = rect.size() * 0.5;
+                            let fill = if self.fill_enabled {
+                                egui::Color32::from_rgba_unmultiplied(
+                                    (self.fill_color[0] * 255.0) as u8,
+                                    (self.fill_color[1] * 255.0) as u8,
+                                    (self.fill_color[2] * 255.0) as u8,
+                                    255,
+                                )
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            painter.add(egui::epaint::EllipseShape { center, radius: radii, fill, stroke: egui::Stroke::new(t, c) });
                         }
                         _ => {}
                     }
@@ -762,7 +989,7 @@ impl eframe::App for AnnotateApp {
                 if response.drag_started_by(egui::PointerButton::Primary) {
                     if let Some(pos) = response.hover_pos() {
                         match self.tool {
-                            Tool::Arrow | Tool::Rectangle => {
+                            Tool::Arrow | Tool::Rectangle | Tool::Oval => {
                                 self.drag = DragState::Drawing { start: pos };
                             }
                             Tool::Text => {
@@ -832,6 +1059,19 @@ impl eframe::App for AnnotateApp {
                                                 max: (img_end.x, img_end.y),
                                                 color: self.current_color4(),
                                                 thickness: self.thickness,
+                                                fill_color: self.current_fill_color4(),
+                                            },
+                                        },
+                                        Tool::Oval => Annotation {
+                                            kind: AnnotationKind::Oval {
+                                                min: (
+                                                    img_start.x,
+                                                    img_start.y,
+                                                ),
+                                                max: (img_end.x, img_end.y),
+                                                color: self.current_color4(),
+                                                thickness: self.thickness,
+                                                fill_color: self.current_fill_color4(),
                                             },
                                         },
                                         _ => unreachable!(),
