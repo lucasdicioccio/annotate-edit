@@ -1097,12 +1097,48 @@ impl eframe::App for AnnotateApp {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: annotate-edit <image.png|jpg>");
-        std::process::exit(1);
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("describe") => {
+            println!(
+                "{}",
+                r#"{
+  "slug": "annotate_edit",
+  "description": "Open an image file for interactive annotation with arrows, rectangles, ovals, and text. Annotations are saved as a JSON sidecar file and exported as an annotated PNG.",
+  "args": [
+    {
+      "name": "path",
+      "description": "Path to the image file to annotate (PNG or JPEG)",
+      "type": "string",
+      "backing_type": "string",
+      "arity": "single",
+      "mode": "dashdashspace"
+    }
+  ]
+}"#
+            );
+            return;
+        }
+        Some("run") => {}
+        _ => {
+            eprintln!("Usage: annotate-edit <describe|run --path <image>>");
+            std::process::exit(1);
+        }
     }
 
-    let image_path = PathBuf::from(&args[1]);
+    // Parse --path <value> from the remaining args after "run"
+    let run_args = &args[2..];
+    let path_value = run_args
+        .windows(2)
+        .find(|w| w[0] == "--path")
+        .map(|w| &w[1]);
+
+    let Some(path_str) = path_value else {
+        eprintln!("Usage: annotate-edit run --path <image>");
+        std::process::exit(1);
+    };
+
+    let image_path = PathBuf::from(path_str);
     if !image_path.exists() {
         eprintln!("File not found: {}", image_path.display());
         std::process::exit(1);
