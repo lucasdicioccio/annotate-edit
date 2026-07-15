@@ -1,5 +1,5 @@
 use eframe::egui;
-use image::{DynamicImage, RgbaImage};
+use image::{imageops, DynamicImage, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -45,6 +45,14 @@ impl Default for Color4 {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+enum Fill {
+    #[default]
+    None,
+    Color(Color4),
+    Blur(f32),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum AnnotationKind {
@@ -59,14 +67,16 @@ enum AnnotationKind {
         max: (f32, f32),
         color: Color4,
         thickness: f32,
-        fill_color: Option<Color4>,
+        #[serde(default)]
+        fill: Fill,
     },
     Oval {
         min: (f32, f32),
         max: (f32, f32),
         color: Color4,
         thickness: f32,
-        fill_color: Option<Color4>,
+        #[serde(default)]
+        fill: Fill,
     },
     Text {
         pos: (f32, f32),
@@ -130,6 +140,13 @@ enum Tool {
     Select,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FillMode {
+    None,
+    Color,
+    Blur,
+}
+
 #[derive(Clone, Debug)]
 enum DragState {
     None,
@@ -153,8 +170,9 @@ struct AnnotateApp {
     color: [f32; 3],
     thickness: f32,
     font_size: f32,
-    fill_enabled: bool,
+    fill_mode: FillMode,
     fill_color: [f32; 3],
+    blur_sigma: f32,
 
     drag: DragState,
     selected: Option<usize>,
@@ -190,8 +208,9 @@ impl AnnotateApp {
             color: [1.0, 0.0, 0.0],
             thickness: 3.0,
             font_size: 20.0,
-            fill_enabled: false,
+            fill_mode: FillMode::None,
             fill_color: [1.0, 1.0, 0.0],
+            blur_sigma: 8.0,
             drag: DragState::None,
             selected: None,
             text_input_pos: None,
@@ -211,16 +230,16 @@ impl AnnotateApp {
         }
     }
 
-    fn current_fill_color4(&self) -> Option<Color4> {
-        if self.fill_enabled {
-            Some(Color4 {
+    fn current_fill(&self) -> Fill {
+        match self.fill_mode {
+            FillMode::None => Fill::None,
+            FillMode::Color => Fill::Color(Color4 {
                 r: self.fill_color[0],
                 g: self.fill_color[1],
                 b: self.fill_color[2],
                 a: 1.0,
-            })
-        } else {
-            None
+            }),
+            FillMode::Blur => Fill::Blur(self.blur_sigma),
         }
     }
 
@@ -295,7 +314,43 @@ impl AnnotateApp {
         }
     }
 
-    fn draw_annotations(&self, painter: &egui::Painter, canvas_rect: egui::Rect) {
+    /// Draws a live-blurred patch of the source image within the given
+    /// image-space bounds. The blur is computed from the original image only
+    /// (not from other annotations drawn on top), same as text annotations,
+    /// this is a GUI-only approximation of the exported result.
+    fn draw_blur_fill(
+        &self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        canvas_rect: egui::Rect,
+        img_bounds: ((f32, f32), (f32, f32)),
+        sigma: f32,
+        oval: bool,
+    ) {
+        let Some(ref raw) = self.raw_image else {
+            return;
+        };
+        let (min, max) = img_bounds;
+        let Some((ox, oy, patch)) = blurred_patch(raw, min.0, min.1, max.0, max.1, sigma, oval)
+        else {
+            return;
+        };
+        let size = [patch.width() as usize, patch.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, patch.as_flat_samples().as_slice());
+        let tex = ctx.load_texture("blur_patch", color_image, egui::TextureOptions::LINEAR);
+        let img_min = egui::pos2(ox as f32, oy as f32);
+        let img_max = img_min + egui::vec2(patch.width() as f32, patch.height() as f32);
+        let s_min = self.image_to_screen(canvas_rect, img_min);
+        let s_max = self.image_to_screen(canvas_rect, img_max);
+        painter.image(
+            tex.id(),
+            egui::Rect::from_two_pos(s_min, s_max),
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
+    fn draw_annotations(&self, ctx: &egui::Context, painter: &egui::Painter, canvas_rect: egui::Rect) {
         for (i, ann) in self.annotations.iter().enumerate() {
             let is_selected = self.selected == Some(i);
             match &ann.kind {
@@ -334,7 +389,7 @@ impl AnnotateApp {
                     max,
                     color,
                     thickness,
-                    fill_color,
+                    fill,
                 } => {
                     let s_min =
                         self.image_to_screen(canvas_rect, egui::pos2(min.0, min.1));
@@ -343,8 +398,19 @@ impl AnnotateApp {
                     let rect = egui::Rect::from_two_pos(s_min, s_max);
                     let c = color.to_egui();
                     let t = thickness * self.zoom;
-                    let fill = fill_color.as_ref().map(|fc| fc.to_egui()).unwrap_or(egui::Color32::TRANSPARENT);
-                    painter.rect(rect, 0.0, fill, egui::Stroke::new(t, c), egui::StrokeKind::Middle);
+                    match fill {
+                        Fill::Blur(sigma) => {
+                            self.draw_blur_fill(ctx, painter, canvas_rect, (*min, *max), *sigma, false);
+                            painter.rect_stroke(rect, 0.0, egui::Stroke::new(t, c), egui::StrokeKind::Middle);
+                        }
+                        _ => {
+                            let fill_c = match fill {
+                                Fill::Color(fc) => fc.to_egui(),
+                                _ => egui::Color32::TRANSPARENT,
+                            };
+                            painter.rect(rect, 0.0, fill_c, egui::Stroke::new(t, c), egui::StrokeKind::Middle);
+                        }
+                    }
                     if is_selected {
                         self.draw_selection_indicator(painter, rect);
                     }
@@ -354,7 +420,7 @@ impl AnnotateApp {
                     max,
                     color,
                     thickness,
-                    fill_color,
+                    fill,
                 } => {
                     let s_min =
                         self.image_to_screen(canvas_rect, egui::pos2(min.0, min.1));
@@ -364,8 +430,19 @@ impl AnnotateApp {
                     let radii = egui::vec2((s_max.x - s_min.x).abs() * 0.5, (s_max.y - s_min.y).abs() * 0.5);
                     let c = color.to_egui();
                     let t = thickness * self.zoom;
-                    let fill = fill_color.as_ref().map(|fc| fc.to_egui()).unwrap_or(egui::Color32::TRANSPARENT);
-                    painter.add(egui::epaint::EllipseShape { center, radius: radii, fill, stroke: egui::Stroke::new(t, c) });
+                    match fill {
+                        Fill::Blur(sigma) => {
+                            self.draw_blur_fill(ctx, painter, canvas_rect, (*min, *max), *sigma, true);
+                            painter.add(egui::epaint::EllipseShape { center, radius: radii, fill: egui::Color32::TRANSPARENT, stroke: egui::Stroke::new(t, c) });
+                        }
+                        _ => {
+                            let fill_c = match fill {
+                                Fill::Color(fc) => fc.to_egui(),
+                                _ => egui::Color32::TRANSPARENT,
+                            };
+                            painter.add(egui::epaint::EllipseShape { center, radius: radii, fill: fill_c, stroke: egui::Stroke::new(t, c) });
+                        }
+                    }
                     let bounding = egui::Rect::from_two_pos(s_min, s_max);
                     if is_selected {
                         self.draw_selection_indicator(painter, bounding);
@@ -429,7 +506,7 @@ impl AnnotateApp {
                     min,
                     max,
                     thickness,
-                    fill_color,
+                    fill,
                     ..
                 } => {
                     let s_min =
@@ -437,7 +514,7 @@ impl AnnotateApp {
                     let s_max =
                         self.image_to_screen(canvas_rect, egui::pos2(max.0, max.1));
                     let rect = egui::Rect::from_two_pos(s_min, s_max);
-                    if fill_color.is_some() {
+                    if !matches!(fill, Fill::None) {
                         rect.expand(thickness * self.zoom + 4.0).contains(screen_pos)
                     } else {
                         let expanded = rect.expand(thickness * self.zoom + 8.0);
@@ -449,7 +526,7 @@ impl AnnotateApp {
                     min,
                     max,
                     thickness,
-                    fill_color,
+                    fill,
                     ..
                 } => {
                     let s_min =
@@ -463,7 +540,7 @@ impl AnnotateApp {
                     let ry = (s_max.y - s_min.y).abs() * 0.5;
                     let dx = screen_pos.x - cx;
                     let dy = screen_pos.y - cy;
-                    if fill_color.is_some() {
+                    if !matches!(fill, Fill::None) {
                         let rx = (rx + slack).max(1.0);
                         let ry = (ry + slack).max(1.0);
                         (dx / rx).powi(2) + (dy / ry).powi(2) <= 1.0
@@ -579,7 +656,7 @@ impl AnnotateApp {
                     max,
                     color,
                     thickness,
-                    fill_color,
+                    fill,
                 } => {
                     let c = [
                         (color.r * 255.0) as u8,
@@ -587,14 +664,24 @@ impl AnnotateApp {
                         (color.b * 255.0) as u8,
                         (color.a * 255.0) as u8,
                     ];
-                    if let Some(fc) = fill_color {
-                        let fc = [
-                            (fc.r * 255.0) as u8,
-                            (fc.g * 255.0) as u8,
-                            (fc.b * 255.0) as u8,
-                            (fc.a * 255.0) as u8,
-                        ];
-                        fill_rect_on_image(&mut img, min.0, min.1, max.0, max.1, fc);
+                    match fill {
+                        Fill::Color(fc) => {
+                            let fc = [
+                                (fc.r * 255.0) as u8,
+                                (fc.g * 255.0) as u8,
+                                (fc.b * 255.0) as u8,
+                                (fc.a * 255.0) as u8,
+                            ];
+                            fill_rect_on_image(&mut img, min.0, min.1, max.0, max.1, fc);
+                        }
+                        Fill::Blur(sigma) => {
+                            if let Some((ox, oy, patch)) =
+                                blurred_patch(&img, min.0, min.1, max.0, max.1, *sigma, false)
+                            {
+                                imageops::overlay(&mut img, &patch, ox as i64, oy as i64);
+                            }
+                        }
+                        Fill::None => {}
                     }
                     draw_line_on_image(
                         &mut img, min.0, min.1, max.0, min.1, *thickness, c,
@@ -614,7 +701,7 @@ impl AnnotateApp {
                     max,
                     color,
                     thickness,
-                    fill_color,
+                    fill,
                 } => {
                     let c = [
                         (color.r * 255.0) as u8,
@@ -626,14 +713,24 @@ impl AnnotateApp {
                     let cy = (min.1 + max.1) * 0.5;
                     let rx = (max.0 - min.0).abs() * 0.5;
                     let ry = (max.1 - min.1).abs() * 0.5;
-                    if let Some(fc) = fill_color {
-                        let fc = [
-                            (fc.r * 255.0) as u8,
-                            (fc.g * 255.0) as u8,
-                            (fc.b * 255.0) as u8,
-                            (fc.a * 255.0) as u8,
-                        ];
-                        fill_oval_on_image(&mut img, cx, cy, rx, ry, fc);
+                    match fill {
+                        Fill::Color(fc) => {
+                            let fc = [
+                                (fc.r * 255.0) as u8,
+                                (fc.g * 255.0) as u8,
+                                (fc.b * 255.0) as u8,
+                                (fc.a * 255.0) as u8,
+                            ];
+                            fill_oval_on_image(&mut img, cx, cy, rx, ry, fc);
+                        }
+                        Fill::Blur(sigma) => {
+                            if let Some((ox, oy, patch)) =
+                                blurred_patch(&img, min.0, min.1, max.0, max.1, *sigma, true)
+                            {
+                                imageops::overlay(&mut img, &patch, ox as i64, oy as i64);
+                            }
+                        }
+                        Fill::None => {}
                     }
                     draw_oval_on_image(&mut img, cx, cy, rx, ry, *thickness, c);
                 }
@@ -750,6 +847,50 @@ fn fill_oval_on_image(
     }
 }
 
+/// Crops `base` to the given image-space bounds (clamped to the image),
+/// applies a gaussian blur with the given sigma, and, if `oval` is set,
+/// zeroes the alpha of pixels outside the inscribed ellipse so the caller
+/// can composite the patch back with alpha blending. Returns the patch
+/// together with its top-left origin in image space.
+fn blurred_patch<V>(
+    base: &V,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    sigma: f32,
+    oval: bool,
+) -> Option<(u32, u32, RgbaImage)>
+where
+    V: image::GenericImageView<Pixel = image::Rgba<u8>> + 'static,
+{
+    let (w, h) = (base.width() as i32, base.height() as i32);
+    let lx = (x0.min(x1) as i32).max(0);
+    let rx = (x0.max(x1) as i32 + 1).min(w);
+    let ty = (y0.min(y1) as i32).max(0);
+    let by = (y0.max(y1) as i32 + 1).min(h);
+    if rx <= lx || by <= ty {
+        return None;
+    }
+    let (lx, ty, rx, by) = (lx as u32, ty as u32, rx as u32, by as u32);
+    let cropped = imageops::crop_imm(base, lx, ty, rx - lx, by - ty).to_image();
+    let mut blurred = imageops::blur(&cropped, sigma.max(0.01));
+    if oval {
+        let cx = (rx - lx) as f32 * 0.5;
+        let cy = (by - ty) as f32 * 0.5;
+        let rrx = cx.max(1.0);
+        let rry = cy.max(1.0);
+        for (px, py, pixel) in blurred.enumerate_pixels_mut() {
+            let dx = (px as f32 + 0.5 - cx) / rrx;
+            let dy = (py as f32 + 0.5 - cy) / rry;
+            if dx * dx + dy * dy > 1.0 {
+                pixel[3] = 0;
+            }
+        }
+    }
+    Some((lx, ty, blurred))
+}
+
 fn fill_rect_on_image(
     img: &mut RgbaImage,
     x0: f32,
@@ -817,11 +958,112 @@ impl eframe::App for AnnotateApp {
                 ui.separator();
                 ui.label("Thickness:");
                 ui.add(egui::Slider::new(&mut self.thickness, 1.0..=20.0));
-                if matches!(self.tool, Tool::Rectangle | Tool::Oval) {
+                // If a Rectangle/Oval annotation is currently selected, the fill
+                // controls edit that annotation directly instead of just setting
+                // the defaults for the next shape drawn.
+                let selected_fillable = if self.tool == Tool::Select {
+                    self.selected.filter(|&i| {
+                        matches!(
+                            self.annotations.get(i).map(|a| &a.kind),
+                            Some(AnnotationKind::Rectangle { .. }) | Some(AnnotationKind::Oval { .. })
+                        )
+                    })
+                } else {
+                    None
+                };
+
+                if matches!(self.tool, Tool::Rectangle | Tool::Oval) || selected_fillable.is_some() {
                     ui.separator();
-                    ui.checkbox(&mut self.fill_enabled, "Fill:");
-                    if self.fill_enabled {
-                        ui.color_edit_button_rgb(&mut self.fill_color);
+                    ui.label("Fill:");
+                    if let Some(idx) = selected_fillable {
+                        let current_fill = match &self.annotations[idx].kind {
+                            AnnotationKind::Rectangle { fill, .. }
+                            | AnnotationKind::Oval { fill, .. } => fill.clone(),
+                            _ => unreachable!(),
+                        };
+                        let mut mode = match current_fill {
+                            Fill::None => FillMode::None,
+                            Fill::Color(_) => FillMode::Color,
+                            Fill::Blur(_) => FillMode::Blur,
+                        };
+                        let mut color = match &current_fill {
+                            Fill::Color(c) => [c.r, c.g, c.b],
+                            _ => self.fill_color,
+                        };
+                        let mut sigma = match current_fill {
+                            Fill::Blur(s) => s,
+                            _ => self.blur_sigma,
+                        };
+
+                        let mut should_push_undo = false;
+                        let mut changed = false;
+                        if ui.selectable_value(&mut mode, FillMode::None, "None").clicked() {
+                            should_push_undo = true;
+                            changed = true;
+                        }
+                        if ui.selectable_value(&mut mode, FillMode::Color, "Color").clicked() {
+                            should_push_undo = true;
+                            changed = true;
+                        }
+                        if ui.selectable_value(&mut mode, FillMode::Blur, "Blur").clicked() {
+                            should_push_undo = true;
+                            changed = true;
+                        }
+                        match mode {
+                            FillMode::Color => {
+                                let resp = ui.color_edit_button_rgb(&mut color);
+                                should_push_undo |= resp.drag_started();
+                                changed |= resp.changed();
+                            }
+                            FillMode::Blur => {
+                                ui.label("Amount:");
+                                let resp = ui.add(egui::Slider::new(&mut sigma, 1.0..=40.0));
+                                should_push_undo |= resp.drag_started();
+                                changed |= resp.changed();
+                            }
+                            FillMode::None => {}
+                        }
+
+                        if changed {
+                            let new_fill = match mode {
+                                FillMode::None => Fill::None,
+                                FillMode::Color => Fill::Color(Color4 {
+                                    r: color[0],
+                                    g: color[1],
+                                    b: color[2],
+                                    a: 1.0,
+                                }),
+                                FillMode::Blur => Fill::Blur(sigma),
+                            };
+                            if should_push_undo {
+                                self.push_undo();
+                            }
+                            if let Some(ann) = self.annotations.get_mut(idx) {
+                                match &mut ann.kind {
+                                    AnnotationKind::Rectangle { fill, .. }
+                                    | AnnotationKind::Oval { fill, .. } => *fill = new_fill,
+                                    _ => {}
+                                }
+                            }
+                            self.auto_save();
+                            self.fill_mode = mode;
+                            self.fill_color = color;
+                            self.blur_sigma = sigma;
+                        }
+                    } else {
+                        ui.selectable_value(&mut self.fill_mode, FillMode::None, "None");
+                        ui.selectable_value(&mut self.fill_mode, FillMode::Color, "Color");
+                        ui.selectable_value(&mut self.fill_mode, FillMode::Blur, "Blur");
+                        match self.fill_mode {
+                            FillMode::Color => {
+                                ui.color_edit_button_rgb(&mut self.fill_color);
+                            }
+                            FillMode::Blur => {
+                                ui.label("Amount:");
+                                ui.add(egui::Slider::new(&mut self.blur_sigma, 1.0..=40.0));
+                            }
+                            FillMode::None => {}
+                        }
                     }
                 }
                 if self.tool == Tool::Text {
@@ -867,7 +1109,7 @@ impl eframe::App for AnnotateApp {
             }
 
             // Draw annotations
-            self.draw_annotations(&painter, canvas_rect);
+            self.draw_annotations(ctx, &painter, canvas_rect);
 
             // Draw in-progress annotation preview
             if let DragState::Drawing { start } = self.drag {
@@ -895,33 +1137,61 @@ impl eframe::App for AnnotateApp {
                         }
                         Tool::Rectangle => {
                             let rect = egui::Rect::from_two_pos(start, current);
-                            let fill = if self.fill_enabled {
-                                egui::Color32::from_rgba_unmultiplied(
-                                    (self.fill_color[0] * 255.0) as u8,
-                                    (self.fill_color[1] * 255.0) as u8,
-                                    (self.fill_color[2] * 255.0) as u8,
-                                    255,
-                                )
+                            if self.fill_mode == FillMode::Blur {
+                                let img_start = self.screen_to_image(canvas_rect, start);
+                                let img_end = self.screen_to_image(canvas_rect, current);
+                                self.draw_blur_fill(
+                                    ctx,
+                                    &painter,
+                                    canvas_rect,
+                                    ((img_start.x, img_start.y), (img_end.x, img_end.y)),
+                                    self.blur_sigma,
+                                    false,
+                                );
+                                painter.rect_stroke(rect, 0.0, egui::Stroke::new(t, c), egui::StrokeKind::Middle);
                             } else {
-                                egui::Color32::TRANSPARENT
-                            };
-                            painter.rect(rect, 0.0, fill, egui::Stroke::new(t, c), egui::StrokeKind::Middle);
+                                let fill = if self.fill_mode == FillMode::Color {
+                                    egui::Color32::from_rgba_unmultiplied(
+                                        (self.fill_color[0] * 255.0) as u8,
+                                        (self.fill_color[1] * 255.0) as u8,
+                                        (self.fill_color[2] * 255.0) as u8,
+                                        255,
+                                    )
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                painter.rect(rect, 0.0, fill, egui::Stroke::new(t, c), egui::StrokeKind::Middle);
+                            }
                         }
                         Tool::Oval => {
                             let rect = egui::Rect::from_two_pos(start, current);
                             let center = rect.center();
                             let radii = rect.size() * 0.5;
-                            let fill = if self.fill_enabled {
-                                egui::Color32::from_rgba_unmultiplied(
-                                    (self.fill_color[0] * 255.0) as u8,
-                                    (self.fill_color[1] * 255.0) as u8,
-                                    (self.fill_color[2] * 255.0) as u8,
-                                    255,
-                                )
+                            if self.fill_mode == FillMode::Blur {
+                                let img_start = self.screen_to_image(canvas_rect, start);
+                                let img_end = self.screen_to_image(canvas_rect, current);
+                                self.draw_blur_fill(
+                                    ctx,
+                                    &painter,
+                                    canvas_rect,
+                                    ((img_start.x, img_start.y), (img_end.x, img_end.y)),
+                                    self.blur_sigma,
+                                    true,
+                                );
+                                painter.add(egui::epaint::EllipseShape { center, radius: radii, fill: egui::Color32::TRANSPARENT, stroke: egui::Stroke::new(t, c) });
                             } else {
-                                egui::Color32::TRANSPARENT
-                            };
-                            painter.add(egui::epaint::EllipseShape { center, radius: radii, fill, stroke: egui::Stroke::new(t, c) });
+                                let fill = if self.fill_mode == FillMode::Color {
+                                    egui::Color32::from_rgba_unmultiplied(
+                                        (self.fill_color[0] * 255.0) as u8,
+                                        (self.fill_color[1] * 255.0) as u8,
+                                        (self.fill_color[2] * 255.0) as u8,
+                                        255,
+                                    )
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+                                painter.add(egui::epaint::EllipseShape { center, radius: radii, fill, stroke: egui::Stroke::new(t, c) });
+                            }
                         }
                         _ => {}
                     }
@@ -1059,7 +1329,7 @@ impl eframe::App for AnnotateApp {
                                                 max: (img_end.x, img_end.y),
                                                 color: self.current_color4(),
                                                 thickness: self.thickness,
-                                                fill_color: self.current_fill_color4(),
+                                                fill: self.current_fill(),
                                             },
                                         },
                                         Tool::Oval => Annotation {
@@ -1071,7 +1341,7 @@ impl eframe::App for AnnotateApp {
                                                 max: (img_end.x, img_end.y),
                                                 color: self.current_color4(),
                                                 thickness: self.thickness,
-                                                fill_color: self.current_fill_color4(),
+                                                fill: self.current_fill(),
                                             },
                                         },
                                         _ => unreachable!(),
