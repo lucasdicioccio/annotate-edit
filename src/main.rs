@@ -1368,11 +1368,21 @@ impl eframe::App for AnnotateApp {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    match args.get(1).map(|s| s.as_str()) {
-        Some("describe") => {
-            println!(
-                "{}",
-                r#"{
+    // Legacy Nautilus script invocation: `annotate-edit <filepath>` with a
+    // single bare argument that isn't a known subcommand is treated the same
+    // as `annotate-edit run --path <filepath>`.
+    let legacy_path = match args.get(1).map(|s| s.as_str()) {
+        Some("describe") | Some("run") => None,
+        Some(_) if args.len() == 2 => Some(args[1].clone()),
+        _ => None,
+    };
+
+    if legacy_path.is_none() {
+        match args.get(1).map(|s| s.as_str()) {
+            Some("describe") => {
+                println!(
+                    "{}",
+                    r#"{
   "slug": "annotate_edit",
   "description": "Open an image file for interactive annotation with arrows, rectangles, ovals, and text. Annotations are saved as a JSON sidecar file and exported as an annotated PNG.",
   "args": [
@@ -1386,22 +1396,26 @@ fn main() {
     }
   ]
 }"#
-            );
-            return;
-        }
-        Some("run") => {}
-        _ => {
-            eprintln!("Usage: annotate-edit <describe|run --path <image>>");
-            std::process::exit(1);
+                );
+                return;
+            }
+            Some("run") => {}
+            _ => {
+                eprintln!("Usage: annotate-edit <describe|run --path <image>|<image>>");
+                std::process::exit(1);
+            }
         }
     }
 
-    // Parse --path <value> from the remaining args after "run"
+    // Parse --path <value> from the remaining args after "run", falling
+    // back to the legacy bare-filename form.
     let run_args = &args[2..];
-    let path_value = run_args
-        .windows(2)
-        .find(|w| w[0] == "--path")
-        .map(|w| &w[1]);
+    let path_value = legacy_path.or_else(|| {
+        run_args
+            .windows(2)
+            .find(|w| w[0] == "--path")
+            .map(|w| w[1].clone())
+    });
 
     let Some(path_str) = path_value else {
         eprintln!("Usage: annotate-edit run --path <image>");
